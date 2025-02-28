@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -69,44 +70,54 @@ func handleConnections(conn net.Conn, store *Store) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 	for {
-		input, err := reader.ReadString('\n')
+		// Try to parse as RESP protocol first
+		req, err := parseRESP(reader)
 		if err != nil {
-			fmt.Println("Error reading:", err)
-			log.Println("*****Client disconnected*****")
-			return
-		}
-		input = strings.TrimSpace(input)
-		parts := strings.Split(input, " ")
+			// If RESP parsing fails, try parsing as plain text
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				fmt.Println("Client disconnected:", err)
+				return
+			}
 
-		if len(parts) < 1 {
-			fmt.Println("Invalid input")
+			// Parse plain text command
+			line = strings.TrimSpace(line)
+			if line == "" {
+				conn.Write([]byte("ERROR: Empty command\n"))
+				continue
+			}
+
+			req = strings.Fields(line)
+		}
+
+		if len(req) == 0 {
+			conn.Write([]byte("ERROR: Empty command\n"))
 			continue
 		}
 
-		commands := strings.ToUpper(parts[0])
-		switch commands {
+		command := strings.ToUpper(req[0])
+
+		switch command {
 		case "SET":
 			{
-				if len(parts) < 3 {
-					fmt.Println("Invalid input, SET command should have 2 arguments a value and a key and optional TTL")
-					conn.Write([]byte("Invalid input, SET command should have 2 arguments a value and a key and optional TTl\n"))
+				if len(req) < 3 {
+					conn.Write([]byte("ERROR: SET command requires at least key and value arguments\n"))
 					continue
 				}
 				ttl := 0
-				if len(parts) == 5 && strings.ToUpper(parts[3]) == "EX" {
-					fmt.Sscanf(parts[4], "%d", &ttl)
+				if len(req) >= 5 && strings.ToUpper(req[3]) == "EX" {
+					fmt.Sscanf(req[4], "%d", &ttl)
 				}
-				store.Set(parts[1], parts[2], ttl)
+				store.Set(req[1], req[2], ttl)
 				conn.Write([]byte("OK\n"))
 			}
 		case "GET":
 			{
-				if len(parts) < 2 || len(parts) > 2 {
-					fmt.Println("Invalid input, GET command should have 1 argument a key")
-					conn.Write([]byte("Invalid input, GET command should have 1 argument a key\n"))
+				if len(req) != 2 {
+					conn.Write([]byte("ERROR: GET command requires exactly one key argument\n"))
 					continue
 				}
-				if val, ok := store.Get(parts[1]); ok {
+				if val, ok := store.Get(req[1]); ok {
 					conn.Write([]byte(val + "\n"))
 				} else {
 					conn.Write([]byte("nil\n"))
@@ -114,17 +125,17 @@ func handleConnections(conn net.Conn, store *Store) {
 			}
 		case "DEL":
 			{
-				if len(parts) < 2 || len(parts) > 2 {
-					conn.Write([]byte("Invalid input, DEL command should have 1 argument a key\n"))
+				if len(req) != 2 {
+					conn.Write([]byte("ERROR: DEL command requires exactly one key argument\n"))
 					continue
 				}
-				DeleteKey := parts[1]
+				DeleteKey := req[1]
 				store.Delete(DeleteKey)
 				conn.Write([]byte("OK\n"))
 			}
 		default:
 			{
-				conn.Write([]byte("Invalid command\n"))
+				conn.Write([]byte("ERROR: Invalid command\n"))
 			}
 		}
 	}
@@ -142,12 +153,63 @@ func acceptConnections(listener net.Listener, store *Store) {
 	}
 }
 
+func parseRESP(reader *bufio.Reader) ([]string, error) {
+	// Peek at the first byte to see if it's a RESP array
+	b, err := reader.Peek(1)
+	if err != nil {
+		return nil, err
+	}
+
+	// If it's not a RESP array, return an error to trigger plain text parsing
+	if b[0] != '*' {
+		return nil, fmt.Errorf("not RESP format")
+	}
+
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	line = strings.TrimSpace(line)
+
+	count := 0
+	_, err = fmt.Sscanf(line, "*%d", &count)
+	if err != nil {
+		return nil, fmt.Errorf("invalid array count: %v", err)
+	}
+
+	args := make([]string, count)
+	for i := range args {
+		lenLine, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		strLen := 0
+		_, err = fmt.Sscanf(lenLine, "$%d", &strLen)
+		if err != nil {
+			return nil, fmt.Errorf("invalid string length: %v", err)
+		}
+
+		data := make([]byte, strLen+2) // +2 for \r\n
+		_, err = io.ReadFull(reader, data)
+		if err != nil {
+			return nil, err
+		}
+
+		if string(data[strLen:]) != "\r\n" {
+			return nil, fmt.Errorf("missing CRLF")
+		}
+
+		args[i] = string(data[:strLen])
+	}
+	return args, nil
+}
+
 func main() {
 	store := NewStore()
 	listener, err := net.Listen("tcp", "localhost:6379")
 	if err != nil {
 		fmt.Println("Error listening:", err)
-		log.Println("*****Client disconnected*****")
+		return
 	}
 	fmt.Println("Server is running on localhost:6379")
 	defer listener.Close()
