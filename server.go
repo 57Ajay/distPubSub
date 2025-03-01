@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -17,19 +18,81 @@ type Store struct {
 	data       map[string]string
 	expiration map[string]time.Time
 
+	// PubSub
 	subscribers map[string]map[net.Conn]bool // {channel:{conn1:true, conn2:true}} EX: {key: {192.8.7.69: true}}
 	pubSubMu    sync.RWMutex
+
+	//AOF
+	aofFile *os.File // This is gonna be Append Only File
 }
 
 func NewStore() *Store {
+
+	aof, err := os.OpenFile("appendonly.aof", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal("Error opening aof File", err)
+	}
+
 	store := &Store{
 		data:       make(map[string]string),
 		expiration: make(map[string]time.Time),
 
 		subscribers: make(map[string]map[net.Conn]bool),
+
+		aofFile: aof,
 	}
+
+	store.LoadAOF()
+
 	go store.cleanUpExpiryKeys()
 	return store
+}
+
+func (s *Store) LoadAOF() {
+	file, err := os.Open("appendonly.aof")
+
+	if err != nil {
+		if os.IsNotExist(err) {
+			return // this means no aif file yet
+		}
+		log.Fatal("Error opening/loading aof file", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		parts := strings.Split(scanner.Text(), " ")
+		if len(parts) < 2 {
+			continue
+		}
+		command := strings.ToUpper(parts[0])
+		switch command {
+		case "SET":
+			{
+				if len(parts) < 3 {
+					continue
+				}
+				key, value := parts[1], parts[2]
+				ttl := 0
+				if len(parts) == 4 {
+					fmt.Sscanf(parts[3], "%d", &ttl)
+				}
+				s.data[key] = value
+				if ttl > 0 {
+					s.expiration[key] = time.Now().Add(time.Duration(ttl) * time.Second)
+				}
+			}
+		case "DEL":
+			{
+				if len(parts) < 2 {
+					continue
+				}
+				key := parts[1]
+				delete(s.data, key)
+			}
+		}
+	}
 }
 
 func (s *Store) Subscribe(key string, conn net.Conn) {
@@ -86,6 +149,10 @@ func (s *Store) Set(key, value string, TTLSeconds int) {
 	} else {
 		delete(s.expiration, key)
 	}
+	if s.aofFile != nil {
+		_, _ = s.aofFile.WriteString(fmt.Sprintf("SET %s %s\n", key, value))
+		s.aofFile.Sync()
+	}
 }
 
 func (s *Store) Delete(key string) {
@@ -93,6 +160,11 @@ func (s *Store) Delete(key string) {
 	defer s.mu.Unlock()
 	delete(s.data, key)
 	delete(s.expiration, key)
+
+	if s.aofFile != nil {
+		_, _ = s.aofFile.WriteString(fmt.Sprintf("DEL %s\n", key))
+		s.aofFile.Sync()
+	}
 }
 
 func (s *Store) cleanUpExpiryKeys() {
@@ -175,7 +247,7 @@ func handleConnections(conn net.Conn, store *Store) {
 				}
 				DeleteKey := req[1]
 				store.Delete(DeleteKey)
-				conn.Write([]byte("OK\n"))
+				conn.Write([]byte(":1\r\n"))
 			}
 		case "SUBSCRIBE":
 			{
