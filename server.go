@@ -42,7 +42,7 @@ func NewStore() *Store {
 		aofFile: aof,
 	}
 
-	store.LoadAOF()
+	go store.LoadAOF()
 
 	go store.cleanUpExpiryKeys()
 	return store
@@ -63,6 +63,7 @@ func (s *Store) LoadAOF() {
 
 	for scanner.Scan() {
 		parts := strings.Split(scanner.Text(), " ")
+		// fmt.Println("Debugging Parts: ", parts)
 		if len(parts) < 2 {
 			continue
 		}
@@ -75,9 +76,11 @@ func (s *Store) LoadAOF() {
 				}
 				key, value := parts[1], parts[2]
 				ttl := 0
-				if len(parts) == 4 {
-					fmt.Sscanf(parts[3], "%d", &ttl)
+				if len(parts) == 5 {
+					// fmt.Println("Debugging TTL: ", parts[4])
+					fmt.Sscanf(parts[4], "%d", &ttl)
 				}
+				// fmt.Println("Debugging Key: ", ttl)
 				s.data[key] = value
 				if ttl > 0 {
 					s.expiration[key] = time.Now().Add(time.Duration(ttl) * time.Second)
@@ -150,7 +153,12 @@ func (s *Store) Set(key, value string, TTLSeconds int) {
 		delete(s.expiration, key)
 	}
 	if s.aofFile != nil {
-		_, _ = s.aofFile.WriteString(fmt.Sprintf("SET %s %s\n", key, value))
+		if TTLSeconds == 0 {
+
+			_, _ = s.aofFile.WriteString(fmt.Sprintf("SET %s %s\n", key, value))
+		} else {
+			_, _ = s.aofFile.WriteString(fmt.Sprintf("SET %s %s EX %d\n", key, value, TTLSeconds))
+		}
 		s.aofFile.Sync()
 	}
 }
